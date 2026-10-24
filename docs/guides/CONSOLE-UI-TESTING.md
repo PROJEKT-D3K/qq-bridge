@@ -41,6 +41,8 @@ node scripts/test-console-ui.mjs --artifacts=docs/ui-verification
 - 改造前 225 个元素 ID 保留，DOM ID 唯一。
 - 九个导航视图及切换后草稿保留，跨越实际的 3 秒状态轮询。
 - 模式及预设、角色创建与切换、静默模式、白名单、安全设置（含系统指令屏蔽与「关闭 SnowLuma 状态指令」）。
+- 关键词攻击防御面板：设置项渲染、待审核列表轮询与「放行 / 废弃」写请求；面板的元素/接线同时由 `test-console-static.mjs` 静态断言（没有 Playwright 的环境靠它兜底）。
+- 回复安全（输出端）面板：分类开关、通知模板、逐字比对窗口、熔断参数与「解除熔断」；待审核列表的类型列（进线 / 出站）。
 - 二代配置上下两个保存按钮的完整 payload，时间单位、零值、工具开关、暂停及恢复。
 - 一代社交参数与会话阶段。
 - 黑话添加、搜索、标签切换、确认对话框与学习参数。
@@ -55,7 +57,7 @@ node scripts/test-console-ui.mjs --artifacts=docs/ui-verification
 - 思考强度：档位来自 DSH 公布的能力（low/high/max）、默认 max、可切换保存，并断言页面明示会连带修改 DSH 全局默认。
 - 无 JavaScript 错误、未知 API 或外部网络请求。
 
-新增的控制台 API 都已在 `console-ui-fixture.mjs` 里 mock；**改动控制台时若加了新接口，必须同步补 mock**，否则本套件会在「未知 API」这一项失败。
+新增的控制台 API 都已在 `console-ui-fixture.mjs` 里 mock（含 `/api/prompt-guard/reviews`、`/api/prompt-guard/decide`、`/api/output-guard/status`、`/api/output-guard/reset`）；**改动控制台时若加了新接口，必须同步补 mock**，否则本套件会在「未知 API」这一项失败。
 
 `--artifacts` 会保存检查结果 JSON、模拟写请求记录和桌面 / 手机截图（浅色与深色各一组），截图时会静止动画以保证可复现。默认不生成额外文件。
 

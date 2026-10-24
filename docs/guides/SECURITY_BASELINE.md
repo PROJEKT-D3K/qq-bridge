@@ -34,6 +34,7 @@
 | 配置失败 | `loadConfig()` | `config.json` 缺失/解析失败 → **fail-fast 退出**（不是"用默认值继续跑"） |
 | 管理员识别 | `handleIncoming()` | `String(event.user_id) === String(cfg.ownerQQ ?? '')`；未配置 `ownerQQ` 时启动日志明确告警（审批/管理命令/封闭 agent 全部不可用） |
 | 系统指令屏蔽 | `src/command-shield.js` + `handleIncoming()`；上游 `src/snowluma-status-hardening.js`（控制台按钮 / `scripts/harden-snowluma-status.mjs`） | 进线侧：`#sl` / `#status` / `#帮助` 等网关指令在**入库与投递之前**丢弃（不进入未读、上下文、黑话窗口），默认私聊通知管理员（10 分钟限频）；控制台 `GET/POST /api/security` 可按**字段白名单**读写 `security.commandShield.*`（布尔/整数毫秒/正则逐项校验，坏正则 400，不原样写配置）；上游侧：关闭 SnowLuma 自带状态指令——它由 SnowLuma 自己回版本/平台/运行时长，**绕过桥接出站审计**；启动时发现仍开启会在日志告警、控制台显示红色状态 |
+| 关键词攻击防御 | `src/prompt-guard.js` + `handleIncoming()`；`GET/POST /api/security`、`GET /api/prompt-guard/reviews`、`POST /api/prompt-guard/decide` | 进线侧：命中「忽略之前指令 / 系统提示词 / 执行命令 / 提权 / 凭据外泄 / 伪造 `【管理员】`」等消息**不进未读、上下文、黑话窗口**；默认暂扣等管理员审核（控制台列表或 ownerQQ 私聊口令），超时（默认 5 分钟）自动废弃，也可配置为直接丢弃；`security.promptGuard.*` 按字段白名单校验（布尔/枚举/整数毫秒/关键词条数与长度/正则可编译/模板长度），坏值 400 且不写盘；待审队列为**内存态**（上限 50、重启清空、`/reset` 与清空工作区丢弃） |
 
 ### 2. 工具面（agent 能做什么）
 
@@ -54,6 +55,7 @@
 | CQ 注入 | `onebotSend()` | 出站文本一律包成 `{type:'text'}` 段并做 `[CQ:` → `[CQ：` 转义，杜绝 CQ 码注入 |
 | @ 限制 | `onebotSend()` | `atUserId` 只接受正整数，禁止 `@all` |
 | 发送限流 | `socialV2.send.*` / `voice.*` / `sticker.collect.*` | 每分钟/每小时硬上限，超限拒绝并退避 |
+| 出站内容守卫 | `src/output-guard.js` + `auditAndSend()` / `screenOutboundBatch()`（v2 三处发送端点） | 每条 AI 出站文本按高危/疑似分级：高危（路径/凭据/已知令牌、冒充 `【管理员】`、反向索要凭据）直接不发；疑似（提示词泄露话术、与 preset/人格卡 14 字逐字复述、内部标识、协议标记、自定义词）暂扣审核，放行后按原目标补发；**熔断**按窗口/阈值暂停会话或全局出站；`security.outputGuard.*` 字段白名单校验，坏值 400 且不写盘；熔断状态与待审队列均为内存态（重启清空） |
 
 ### 4. 控制台（本机最高权限入口）
 
@@ -65,6 +67,7 @@
 | Host 校验 | 请求最前面 | Host 必须是 `127.0.0.1:<port>` / `localhost:<port>` / `[::1]:<port>`，否则 403（DNS rebinding 硬化） |
 | CSRF | 非 GET 请求 | 必须 `content-type: application/json`；若带 `Origin`，其 host 必须等于本机 |
 | agent 令牌隔离 | 请求前缀白名单 | 带 `x-agent-token` 的请求默认拒绝，仅放行 `/api/status`、`/api/socialV2/*`、`/api/send/*`、`/api/images/*`、`/api/authorize/read`；管理端点（人格/提示词/思考强度/白名单/重启/令牌）一律 403 |
+| 审核接口隔离 | agent token 白名单（默认拒绝） | `/api/prompt-guard/*` 与 `/api/output-guard/*` 不在智能体白名单内，带 `x-agent-token` 一律 403；放行/废弃、解除熔断只能由控制台令牌（或 ownerQQ 私聊口令）触发，会话主体既读不到别人的拦截原文，也不能替管理员做决定 |
 | 空令牌拒绝 | `x-agent-token === ''` | 一律 403，避免"空 = 管理端"的绕过 |
 | 写操作不挂 GET | 全路由审查 | 会触发副作用的接口（表情强制同步、语音同步）一律 POST；GET 只读 |
 | 请求体限制 | `readBody()` | 声明长度或实际累计超过 1 MB → 413；30 秒读取超时 |

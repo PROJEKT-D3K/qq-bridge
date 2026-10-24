@@ -34,6 +34,12 @@ const tests = [
   // 系统指令屏蔽（#sl / #status / #帮助 …）：识别与误伤边界 + 端到端不进入未读/不投递。
   // 背景：SnowLuma 自带状态指令会直接回版本/平台，且默认 swallow=false 还会把原消息送给 agent。
   'test-command-shield.mjs',
+  // 关键词攻击防御（提示注入）：命中即暂扣/丢弃，不进入未读与上下文；
+  // 审核放行/超时废弃/管理员私聊口令/自定义关键词/customOnly 与配置校验。
+  'test-prompt-guard.mjs',
+  // 出站内容守卫：高危直接不发、疑似暂扣审核、逐字复述指纹、反向索要凭据、
+  // 冒充管理员/内部标识，以及可配置熔断（阈值/窗口/暂停/全局范围）。
+  'test-output-guard.mjs',
   // 令牌账本 / 价目表 与 体检修复回归（纯函数，无外部依赖）
   'test-token-usage.mjs', 'test-hardening.mjs',
   // 语音发送（纯函数 + 端点存在性；真发语音只在 --live 或 CLI 里做）

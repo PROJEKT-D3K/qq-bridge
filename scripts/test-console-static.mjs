@@ -51,6 +51,38 @@ ok(/api\('\/api\/security'/.test(html), '面板调用 /api/security');
 ok(/commandShield: \{/.test(html), '保存时提交 commandShield 字段');
 ok(/disableSnowLumaStatus: true/.test(html), '一键关闭提交 disableSnowLumaStatus');
 
+console.log('## 关键词攻击防御面板接线');
+for (const id of ['pgEnabled', 'pgAction', 'pgTimeout', 'pgSkipOwner', 'pgKeywords', 'pgCustomOnly', 'pgExtra', 'pgNotifyGroup', 'pgGroupTemplate', 'pgNotifyOwner', 'pgOwnerTemplate', 'pgSave', 'pgMsg', 'pgStatus', 'pgReviewMeta', 'pgReviewList']) {
+  const n = (html.match(new RegExp(`id="${id}"`, 'g')) ?? []).length;
+  ok(n === 1, `面板元素 ${id}`, `${n} 处`);
+}
+ok(/getElementById\('pgSave'\)\.addEventListener/.test(html), '保存按钮已绑定事件');
+ok(/getElementById\('pgReviewList'\)\.addEventListener/.test(html), '审核列表已绑定放行/废弃');
+ok(/api\('\/api\/prompt-guard\/reviews'/.test(html), '面板轮询 /api/prompt-guard/reviews');
+ok(/api\('\/api\/prompt-guard\/decide'/.test(html), '放行/废弃调用 /api/prompt-guard/decide');
+ok(/promptGuard: \{/.test(html), '保存时提交 promptGuard 字段');
+ok(/customOnly: document\.getElementById\('pgCustomOnly'\)\.checked/.test(html), '提交 customOnly');
+ok(/keywords: promptGuardLines\(document\.getElementById\('pgKeywords'\)\.value\)/.test(html), '提交 keywords');
+ok(html.includes('可用变量：') && html.includes('{id}') && html.includes('{rule}'), '面板列出模板变量');
+
+console.log('## 出站守卫面板接线');
+for (const id of ['ogEnabled', 'ogAction', 'ogTimeout', 'ogSkipOwner', 'ogHardCredentials', 'ogHardImpersonation', 'ogHardCredentialRequest',
+  'ogSuspectPromptLeak', 'ogSuspectFingerprint', 'ogSuspectInternal', 'ogSuspectProtocol', 'ogSuspectCustom',
+  'ogKeywords', 'ogExtra', 'ogFingerprintMin', 'ogFingerprintHits', 'ogStatus',
+  'ogNotifyGroup', 'ogGroupTemplate', 'ogNotifyOwner', 'ogOwnerTemplate', 'ogBlockedReply',
+  'ogBreakerEnabled', 'ogBreakerThreshold', 'ogBreakerWindow', 'ogBreakerPause', 'ogBreakerScope',
+  'ogBreakerCountHard', 'ogBreakerCountSuspect', 'ogBreakerReset', 'ogBreakerMsg', 'ogBreakerStatus', 'ogSave', 'ogMsg']) {
+  const n = (html.match(new RegExp(`id="${id}"`, 'g')) ?? []).length;
+  ok(n === 1, `面板元素 ${id}`, `${n} 处`);
+}
+ok(/getElementById\('ogSave'\)\.addEventListener/.test(html), '保存按钮已绑定事件');
+ok(/getElementById\('ogBreakerReset'\)\.addEventListener/.test(html), '解除熔断已绑定事件');
+ok(/api\('\/api\/output-guard\/status'/.test(html), '面板轮询 /api/output-guard/status');
+ok(/api\('\/api\/output-guard\/reset'/.test(html), '解除熔断调用 /api/output-guard/reset');
+ok(/outputGuard: \{/.test(html), '保存时提交 outputGuard 字段');
+ok(/breaker: \{/.test(html), '提交熔断配置');
+ok(/item\.type === 'out'/.test(html), '待审核列表区分进线/出站');
+
 console.log('## JS 语法');
 const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
 const big = scripts.sort((a, b) => b.length - a.length)[0];
@@ -84,6 +116,10 @@ const fixture = fs.readFileSync(path.join(ROOT, 'scripts', 'console-ui-fixture.m
 ok(fixture.includes("case '/api/socialV2/voices'"), 'fixture mock 了 /api/socialV2/voices');
 ok(fixture.includes("case '/api/voice/send'"), 'fixture mock 了 /api/voice/send');
 ok(fixture.includes('disableSnowLumaStatus'), 'fixture mock 了控制台的一键关闭 SnowLuma 状态指令');
+ok(fixture.includes("case '/api/prompt-guard/reviews'"), 'fixture mock 了关键词拦截审核列表');
+ok(fixture.includes("case '/api/prompt-guard/decide'"), 'fixture mock 了关键词拦截放行/废弃');
+ok(fixture.includes("case '/api/output-guard/status'"), 'fixture mock 了出站熔断状态');
+ok(fixture.includes("case '/api/output-guard/reset'"), 'fixture mock 了出站熔断解除');
 
 console.log(bad === 0 ? '\n全部通过' : `\n${bad} 项失败`);
 if (bad > 0) process.exit(1);

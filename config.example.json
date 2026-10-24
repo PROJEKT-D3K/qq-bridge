@@ -58,6 +58,71 @@
       "notifyOwner": true,
       "notifyCooldownMs": 600000,
       "extraPatterns": []
+    },
+    "promptGuard": {
+      "enabled": true,
+      "action": "review",
+      "reviewTimeoutMs": 300000,
+      "skipOwner": true,
+      "customOnly": false,
+      "keywords": [],
+      "extraPatterns": [],
+      "notifyGroup": {
+        "enabled": false,
+        "cooldownMs": 60000,
+        "template": "⚠️ 这条消息触发了安全防护（{status}），不会交给 AI 处理。"
+      },
+      "notifyOwner": {
+        "enabled": true,
+        "cooldownMs": 60000,
+        "template": "🛡️ 关键词攻击拦截 #{id}｜会话：{conv}｜发送者：{sender}（{userId}）｜命中：{rule}｜{status}｜原文：{text}｜{detail}"
+      }
+    },
+    "outputGuard": {
+      "enabled": true,
+      "action": "tiered",
+      "reviewTimeoutMs": 180000,
+      "skipOwnerPrivate": true,
+      "hard": {
+        "credentials": true,
+        "impersonation": true,
+        "credentialRequest": true
+      },
+      "suspect": {
+        "promptLeak": true,
+        "fingerprint": true,
+        "internal": true,
+        "protocol": true,
+        "custom": true
+      },
+      "keywords": [],
+      "extraPatterns": [],
+      "fingerprint": {
+        "minChars": 14,
+        "minHits": 1
+      },
+      "notifyGroup": {
+        "enabled": false,
+        "cooldownMs": 60000,
+        "template": "⚠️ 这条回复触发了安全防护（{rule}），未发出。"
+      },
+      "notifyOwner": {
+        "enabled": true,
+        "cooldownMs": 60000,
+        "template": "🛡️ 回复拦截｜{type}｜{conv}｜{source}｜命中：{rule}｜{status}｜原文：{text}｜{detail}"
+      },
+      "blockedReply": "",
+      "breaker": {
+        "enabled": true,
+        "threshold": 5,
+        "windowMs": 600000,
+        "pauseMs": 900000,
+        "scope": "conversation",
+        "countHard": true,
+        "countSuspect": true,
+        "notifyOwner": true,
+        "template": "🔥 出站已熔断：{conv} 在 {minutes} 分钟内命中 {hits} 次（最近：{rule}），已暂停发送 {pauseMinutes} 分钟。回复「解除熔断」或到控制台恢复。"
+      }
     }
   },
   "slang": {

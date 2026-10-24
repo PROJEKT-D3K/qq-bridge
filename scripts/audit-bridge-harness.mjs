@@ -11,6 +11,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import * as markdown from '../src/md-to-plain.js';
 import * as sensitive from '../src/sensitive.js';
 import * as commandShield from '../src/command-shield.js';
+import * as promptGuard from '../src/prompt-guard.js';
+import * as outputGuard from '../src/output-guard.js';
 import * as snowlumaConn from '../src/snowluma-conn.js';
 import * as snowlumaStatusHardening from '../src/snowluma-status-hardening.js';
 import * as wait from '../src/v2-wait.js';
@@ -23,6 +25,7 @@ import * as modelPrices from '../src/model-prices.js';
 import * as tokenLedger from '../src/token-ledger.js';
 import * as voiceLib from '../src/send-voice-lib.js';
 import * as presetPrompt from '../src/preset-prompt.js';
+import * as roleCard from '../src/role-card.js';
 import * as stateAcl from '../src/state-acl.mjs';
 import { unwrap, createTurnCollector } from '../src/dsh-client.js';
 
@@ -102,6 +105,20 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     callUnary: async (method, params) => { calls.cancelled.push({ method, params }); return success({ accepted: true }); },
   };
   class FakeBot {
+    constructor() {
+      // 引用解析用的固定原文：默认是一句正常聊天；测试可以改 quoteText 来验证
+      // 「引用内容也会进模型上下文，所以引用里的注入同样要拦」。
+      this.quoteText = '这是被引用的原文';
+    }
+    async getMessage(id) {
+      return {
+        message_id: Number(id),
+        group_id: 456,
+        user_id: 111,
+        message: [{ type: 'text', data: { text: this.quoteText } }],
+        sender: { nickname: '引用者', card: '引用者', user_id: 111 }
+      };
+    }
     async sendPrivateMessage(id, text) { calls.sent.push({ kind: 'private', id, text }); }
     async sendGroupMessage(id, text) { calls.sent.push({ kind: 'group', id, text }); }
     async getImage({ file }) {
@@ -147,7 +164,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
   source = source.replace('  bot.onPrivateMessage(async (event) => {', `
   return {
     ensureSession, ensureSlangLearnerSession, resolvePresetName, deliverPrompt, drainPromptQueue,
-    sendToQQ, sendStickerV2, handleIncoming, startConsoleServer, cfg, state, api, promptQueues,
+    sendToQQ, sendStickerV2, handleIncoming, auditAndSend, screenOutbound, screenOutboundBatch, outputGuardBreaker, startConsoleServer, cfg, state, api, promptQueues,
     getSocialV2State, appendSocialV2Message, recordSentMessagesV2,
     buildWakePromptV2, buildWakeSnapshotV2, sendWakePromptV2, socialV2,
     syncStickerLibrary, listStickersForV2, getStickerImageData,
@@ -189,8 +206,8 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     NodeApiClient: class { constructor() { return api; } },
     SnowLumaWebSocketClient: FakeBot, text: (s) => s,
     discoverDshLaunchToken: () => '', unwrap, createTurnCollector,
-    ...markdown, ...sensitive, ...commandShield, ...snowlumaConn, ...snowlumaStatusHardening, ...wait, ...safeFetch, ...forward, ...slang, ...sticker,
-    ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, ...presetPrompt,
+    ...markdown, ...sensitive, ...commandShield, ...promptGuard, ...outputGuard, ...snowlumaConn, ...snowlumaStatusHardening, ...wait, ...safeFetch, ...forward, ...slang, ...sticker,
+    ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, ...presetPrompt, ...roleCard,
     // 桥接的出图出口会调归一化（体积/动图抽帧）：VM 里必须能拿到这几个函数。
     normalizeImageForModel: mediaNormalize.normalizeImageForModel,
     sniffImage: mediaNormalize.sniffImage,

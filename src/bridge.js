@@ -20,6 +20,8 @@ import { NodeApiClient, unwrap, createTurnCollector, discoverDshBaseUrl, discove
 import { mdToPlain, splitForQQ, truncateText, truncateTextTail } from './md-to-plain.js';
 import { SENSITIVE_RE } from './sensitive.js';
 import { COMMAND_SHIELD_DEFAULTS, matchCommandShield, commandTokenPattern, validateCommandShieldPatterns } from './command-shield.js';
+import { PROMPT_GUARD_DEFAULTS, matchPromptGuard, mergePromptGuardConfig, validatePromptGuardPatch, renderPromptGuardTemplate, parsePromptGuardCommand } from './prompt-guard.js';
+import { OUTPUT_GUARD_DEFAULTS, matchOutputGuard, buildPromptFingerprint, matchPromptFingerprint, createOutputBreaker, parseBreakerCommand, mergeOutputGuardConfig, validateOutputGuardPatch } from './output-guard.js';
 import { looksLikeUnfinished } from './v2-wait.js';
 import { compactModelMessage, describeAge } from './qq-model-view.js';
 import { safeFetchBuffer, looksLikeImageBuffer } from './safe-fetch.js';
@@ -704,7 +706,16 @@ function loadConfig() {
       // 允许 config.json 里把 commandShield 直接写成 false 来整体关闭。
       commandShield: file.security?.commandShield === false
         ? { ...COMMAND_SHIELD_DEFAULTS, enabled: false }
-        : { ...COMMAND_SHIELD_DEFAULTS, ...(file.security?.commandShield ?? {}) }
+        : { ...COMMAND_SHIELD_DEFAULTS, ...(file.security?.commandShield ?? {}) },
+      // 关键词攻击防御（提示注入/越权诱导；见 src/prompt-guard.js）。
+      // 同样允许 config.json 里把 promptGuard 直接写成 false 来整体关闭。
+      promptGuard: file.security?.promptGuard === false
+        ? mergePromptGuardConfig({ enabled: false })
+        : mergePromptGuardConfig(file.security?.promptGuard),
+      // 出站内容守卫（提示词复述/内部标识/冒充管理员/反向钓鱼）与熔断。
+      outputGuard: file.security?.outputGuard === false
+        ? mergeOutputGuardConfig({ enabled: false })
+        : mergeOutputGuardConfig(file.security?.outputGuard)
     },
     slang: {
       enabled: true,
@@ -1467,6 +1478,16 @@ let stateDirHardened = null;
 // ── 主流程 ──────────────────────────────────────────────────────────────────
 async function main() {
   const cfg = loadConfig();
+  // 关键词攻击防御的待审核队列（进线侧暂扣，见 src/prompt-guard.js）。
+  // 必须在 main 的最前面声明：控制台与消息处理都是闭包，不能依赖后面才初始化的 const。
+  const promptGuardReviews = new Map(); // id -> entry
+  const promptGuardNotifyAt = new Map(); // 'owner' | 'group:<key>' -> 上次通知时间
+  let promptGuardSeq = 0;
+  const PROMPT_GUARD_MAX_PENDING = 50;
+  // 出站守卫的熔断器与通知冷却（状态只在内存，重启即恢复发送）。
+  const outputGuardBreaker = createOutputBreaker();
+  const outputGuardNotifyAt = new Map();
+  let outputFingerprintCache = { key: '', fp: null, builtAt: 0 };
   inspectSnowLumaStatusCommands(cfg);
   fs.mkdirSync(STATE_DIR, { recursive: true });
   hardenStateDirAcl();
@@ -4328,6 +4349,60 @@ async function main() {
             });
             return;
           }
+          // 出站守卫设置（security.outputGuard.*）。
+          if (body.outputGuard !== undefined) {
+            const configFile = path.join(ROOT, 'config.json');
+            // fail-fast：配置损坏时直接 500，绝不回写（与其它安全接口同语义）
+            const file = readConfigObject(configFile);
+            const { errors, next } = validateOutputGuardPatch(body.outputGuard, cfg.security?.outputGuard);
+            if (errors.length > 0) {
+              sendJson({ ok: false, error: errors[0] }, 400);
+              return;
+            }
+            file.security = { ...(file.security ?? {}), outputGuard: next };
+            atomicWriteJson(configFile, file);
+            cfg.security = { ...(cfg.security ?? {}), outputGuard: next };
+            outputFingerprintCache = { key: '', fp: null, builtAt: 0 };
+            // 关闭守卫 / 关掉熔断开关时，已熔断状态立即解除（否则界面显示“已关还在停发”）。
+            if (next.enabled === false || next.breaker?.enabled === false) outputGuardBreaker.reset();
+            // 关掉守卫时，已暂扣的出站项按废弃处理（不再保留一个无法解释的队列）。
+            if (next.enabled === false) {
+              for (const [id, entry] of [...promptGuardReviews.entries()]) {
+                if (entry.type !== 'out') continue;
+                clearTimeout(entry.timer);
+                promptGuardReviews.delete(id);
+                appendActivity(`${entry.key} 【拦截审核】#${id} 出站守卫已关闭，按废弃处理`);
+              }
+            }
+            log(`控制台：出站守卫已更新（enabled=${next.enabled !== false}，action=${next.action}，breaker=${next.breaker.enabled !== false}，keywords=${next.keywords.length}）`);
+            sendJson({ ok: true, security: cfg.security, outputGuard: next });
+            return;
+          }
+          // 关键词攻击防御设置（security.promptGuard.*）。
+          if (body.promptGuard !== undefined) {
+            const configFile = path.join(ROOT, 'config.json');
+            // fail-fast：配置损坏时直接 500，绝不回写（与白名单/指令屏蔽接口同语义）
+            const file = readConfigObject(configFile);
+            const { errors, next } = validatePromptGuardPatch(body.promptGuard, cfg.security?.promptGuard);
+            if (errors.length > 0) {
+              sendJson({ ok: false, error: errors[0] }, 400);
+              return;
+            }
+            file.security = { ...(file.security ?? {}), promptGuard: next };
+            atomicWriteJson(configFile, file);
+            cfg.security = { ...(cfg.security ?? {}), promptGuard: next };
+            // 切到「直接废弃」时，已暂扣的项立即按废弃处理，避免「关了审核还躺在列表里」。
+            if (next.action === 'discard') {
+              for (const [id, entry] of [...promptGuardReviews.entries()]) {
+                clearTimeout(entry.timer);
+                promptGuardReviews.delete(id);
+                appendActivity(`${entry.key} 【关键词拦截】#${id} 已切换为直接废弃，按废弃处理`);
+              }
+            }
+            log(`控制台：关键词攻击防御已更新（enabled=${next.enabled !== false}，action=${next.action}，customOnly=${next.customOnly === true}，keywords=${next.keywords.length}，timeout=${next.reviewTimeoutMs}ms）`);
+            sendJson({ ok: true, security: cfg.security, promptGuard: next });
+            return;
+          }
           // 系统指令屏蔽设置（security.commandShield.*）。
           // 这里做白名单字段 + 类型校验：不能把控制台请求体原样写进 config.json。
           if (body.commandShield !== undefined) {
@@ -4387,6 +4462,84 @@ async function main() {
           cfg.security = { ...(cfg.security ?? {}), ...next };
           log(`控制台：安全拦截通知已更新（interceptNotify=${cfg.security.interceptNotify}）`);
           sendJson({ ok: true, security: cfg.security });
+          return;
+        }
+        // ── 关键词攻击防御：待审核列表 + 放行/废弃（仅控制台） ────────────────
+        if (req.method === 'GET' && url.pathname === '/api/prompt-guard/reviews') {
+          const now = Date.now();
+          const reviews = [];
+          for (const entry of promptGuardReviews.values()) {
+            reviews.push({
+              id: entry.id,
+              type: entry.type === 'out' ? 'out' : 'in',
+              key: entry.key,
+              kind: entry.kind,
+              sender: entry.sender,
+              userId: entry.userId,
+              rule: entry.rule,
+              ruleId: entry.hit?.id ?? '',
+              source: entry.source ?? 'message',
+              text: String(entry.text ?? '').slice(0, 300),
+              at: entry.at,
+              expiresAt: entry.expiresAt,
+              remainingMs: Math.max(0, entry.expiresAt - now)
+            });
+          }
+          reviews.sort((a, b) => a.id - b.id);
+          const pg = effectivePromptGuard();
+          sendJson({
+            ok: true,
+            enabled: pg.enabled !== false,
+            action: pg.action === 'discard' ? 'discard' : 'review',
+            max: PROMPT_GUARD_MAX_PENDING,
+            reviews
+          });
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/prompt-guard/decide') {
+          const body = await readBody();
+          const id = Number(body.id);
+          const action = body.action === 'allow' ? 'allow' : body.action === 'discard' ? 'discard' : null;
+          if (!Number.isInteger(id) || id <= 0 || !action) {
+            sendJson({ ok: false, error: 'id 必须是正整数，action 只能是 allow 或 discard' }, 400);
+            return;
+          }
+          const result = await decidePromptGuardReview(id, action, 'console');
+          if (!result.ok) {
+            sendJson({ ok: false, error: result.error ?? '处理失败' }, 404);
+            return;
+          }
+          sendJson({ ok: true, id, action: result.action, type: result.type });
+          return;
+        }
+        // ── 出站守卫：熔断状态 / 手动解除（仅控制台） ────────────────────────
+        if (req.method === 'GET' && url.pathname === '/api/output-guard/status') {
+          const og = outputGuardCfg();
+          let fingerprint = null;
+          if (og.enabled !== false && og.suspect?.fingerprint !== false) {
+            try {
+              const fp = currentOutputFingerprint();
+              if (fp) fingerprint = { minChars: fp.minChars, size: fp.size, chars: fp.chars, builtAt: fp.builtAt };
+            } catch {}
+          }
+          const breaker = outputGuardBreaker.status();
+          const all = [...promptGuardReviews.values()];
+          sendJson({
+            ok: true,
+            enabled: og.enabled !== false,
+            action: og.action,
+            pendingOut: all.filter((entry) => entry.type === 'out').length,
+            pendingIn: all.filter((entry) => entry.type !== 'out').length,
+            fingerprint,
+            breaker: breaker || null,
+            breakerConfig: og.breaker
+          });
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/output-guard/reset') {
+          outputGuardBreaker.reset();
+          log('控制台：出站熔断已手动解除');
+          sendJson({ ok: true, breaker: null });
           return;
         }
         // ── 控制台访问令牌（可手动修改/生成随机） ─────────────────────────────
@@ -5353,10 +5506,21 @@ async function main() {
               sendJson({ ok: false, error: `单条消息不能超过 ${maxChars} 字` }, 400);
               return;
             }
-            if (SENSITIVE_RE.test(msg)) {
-              sendJson({ ok: false, error: '消息含敏感信息，已阻止发送' }, 403);
-              return;
-            }
+          }
+          // 出站守卫：高危直接拦、疑似暂扣审核、熔断静默；在预占发送额度之前判定。
+          const screened = screenOutboundBatch(key, messages);
+          if (screened.action === 'paused' || screened.action === 'block') {
+            sendJson({
+              ok: false,
+              error: screened.action === 'paused'
+                ? '发送已熔断，请联系管理员恢复'
+                : `回复含高危内容（${screened.hit?.label ?? '安全策略'}），已阻止发送`
+            }, 403);
+            return;
+          }
+          if (screened.action === 'review') {
+            sendJson({ ok: true, pending: true, reviewId: screened.reviewId, note: '消息已暂扣，等待管理员审核后发出' });
+            return;
           }
           const st = getSocialV2State(key);
           const now = Date.now();
@@ -5484,10 +5648,21 @@ async function main() {
               sendJson({ ok: false, error: `单条消息不能超过 ${maxChars} 字` }, 400);
               return;
             }
-            if (SENSITIVE_RE.test(msg)) {
-              sendJson({ ok: false, error: '消息含敏感信息，已阻止发送' }, 403);
-              return;
-            }
+          }
+          // 出站守卫：引用/at 在正式发送前还会再解析一次，这里先存原值，放行时重放。
+          const screened = screenOutboundBatch(key, messages, { replyToMessageId, atUserId });
+          if (screened.action === 'paused' || screened.action === 'block') {
+            sendJson({
+              ok: false,
+              error: screened.action === 'paused'
+                ? '发送已熔断，请联系管理员恢复'
+                : `回复含高危内容（${screened.hit?.label ?? '安全策略'}），已阻止发送`
+            }, 403);
+            return;
+          }
+          if (screened.action === 'review') {
+            sendJson({ ok: true, pending: true, reviewId: screened.reviewId, note: '消息已暂扣，等待管理员审核后发出' });
+            return;
           }
           const delays = computeGapsV2(messages, gapMode, gapMs, gaps, sendCfg);
           // 先做发送频率检查并预占额度，再解析引用目标，避免未限流的引用查询打爆 OneBot。
@@ -7202,7 +7377,26 @@ async function main() {
           const sendCfg = cfg.socialV2?.send ?? {};
           const maxChars = Math.max(1, Number(sendCfg.maxMessageChars) || 500);
           if (message.length > maxChars) { sendJson({ ok: false, error: `单条消息不能超过 ${maxChars} 字` }, 400); return; }
-          if (SENSITIVE_RE.test(message)) { sendJson({ ok: false, error: '消息含敏感信息，已阻止发送' }, 403); return; }
+          // 出站守卫：旧 /api/send/* 通道与 v2 工具共用同一套判定与暂扣队列。
+          const screened = screenOutbound(key, message, {
+            source: 'tool',
+            messages: [message],
+            replyToMessageId: actualReplyToMessageId,
+            atUserId
+          });
+          if (screened.action === 'paused' || screened.action === 'block') {
+            sendJson({
+              ok: false,
+              error: screened.action === 'paused'
+                ? '发送已熔断，请联系管理员恢复'
+                : `回复含高危内容（${screened.hit?.label ?? '安全策略'}），已阻止发送`
+            }, 403);
+            return;
+          }
+          if (screened.action === 'review') {
+            sendJson({ ok: true, pending: true, reviewId: screened.reviewId, note: '消息已暂扣，等待管理员审核后发出' });
+            return;
+          }
           // st/now 必须声明在 try **之外**：下面的 catch 要用它们回滚预占的发送额度。
           // 写在 try 里时 catch 拿到的是块作用域外的名字 ⇒ ReferenceError（send-burst
           // 曾整段踩过同型问题，见体检报告 #1 / R2）。后果不是"少一行日志"，而是
@@ -7273,6 +7467,8 @@ async function main() {
             cancelPendingEntry(pe).catch(() => {});
           }
           pending.delete(key);
+          // 待审核的拦截项跟着会话一起作废：否则放行时会凭空建出一个新会话。
+          dropPromptGuardReviewsFor(key);
           queued.delete(key);
           queuedHintAt.delete(key);
           sessionPromises.delete(key);
@@ -7336,6 +7532,7 @@ async function main() {
             cancelPendingEntry(entry).catch(() => {});
           }
           pending.clear();
+          dropAllPromptGuardReviews('工作区已清空');
           queued.clear();
           queuedHintAt.clear();
           sessionPromises.clear();
@@ -7487,6 +7684,336 @@ async function main() {
     } catch (error) {
       log(`系统指令拦截通知发送失败：${error?.message ?? error}`);
     }
+  }
+
+  // ── 关键词攻击防御（prompt guard） ────────────────────────────────────────
+  // 判定见 src/prompt-guard.js。命中后消息不进未读队列 / 上下文 / 黑话窗口；
+  // 默认暂扣等管理员审核（控制台或私聊口令），超时按废弃处理。
+  function effectivePromptGuard() {
+    return cfg.security?.promptGuard ?? PROMPT_GUARD_DEFAULTS;
+  }
+
+  function sanitizeGuardNotice(value, max = 600) {
+    const s = String(value ?? '').replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, ' ').trim();
+    return s.length > max ? s.slice(0, max) : s;
+  }
+
+  function promptGuardNoticeVars(entry, action) {
+    const minutes = Math.max(1, Math.round(entry.timeoutMs / 60000));
+    return {
+      id: entry.id,
+      status: action === 'review' ? '待审核' : '已拦截',
+      detail: action === 'review'
+        ? `控制台「访问与安全」可放行/废弃，或私聊回复「放行 ${entry.id}」/「废弃 ${entry.id}」；${minutes} 分钟内不处理将自动废弃。`
+        : '该消息已丢弃，不会交给 AI。',
+      conv: entry.key,
+      sender: entry.sender,
+      userId: entry.userId,
+      rule: entry.rule,
+      text: truncateText(entry.text, 200),
+      minutes
+    };
+  }
+
+  // 群内 / 管理员私信通知。按群与管理员各算一次冷却，避免被反复触发刷屏。
+  function notifyPromptGuard(entry, action) {
+    const pg = effectivePromptGuard();
+    const vars = promptGuardNoticeVars(entry, action);
+    const now = Date.now();
+    const emit = (target, notice, slot) => {
+      if (!notice || notice.enabled !== true) return;
+      const template = String(notice.template ?? '').trim();
+      if (!template) return;
+      const cooldown = Math.max(0, Number(notice.cooldownMs ?? 0) || 0);
+      const last = promptGuardNotifyAt.get(slot) ?? 0;
+      if (cooldown > 0 && now - last < cooldown) return;
+      promptGuardNotifyAt.set(slot, now);
+      const text = sanitizeGuardNotice(renderPromptGuardTemplate(template, vars));
+      if (!text) return;
+      sendToQQ(target, text).catch((error) => log(`关键词防御通知发送失败（${target}）：${error?.message ?? error}`));
+    };
+    if (entry.kind === 'group') emit(entry.key, pg.notifyGroup, `group:${entry.key}`);
+    if (cfg.ownerQQ) emit(`private:${cfg.ownerQQ}`, pg.notifyOwner, 'owner');
+  }
+
+  function registerPromptGuardReview(entry) {
+    entry.type = entry.type ?? 'in';
+    promptGuardSeq += 1;
+    entry.id = promptGuardSeq;
+    entry.at = Date.now();
+    entry.expiresAt = entry.at + entry.timeoutMs;
+    const typeLabel = entry.type === 'out' ? '出站' : '进线';
+    entry.timer = setTimeout(() => {
+      const current = promptGuardReviews.get(entry.id);
+      if (current !== entry) return;
+      promptGuardReviews.delete(entry.id);
+      appendActivity(`${entry.key} 【拦截审核】#${entry.id}（${typeLabel}）超时未审核，已丢弃`);
+      log(`🛡️ 拦截审核 #${entry.id}（${typeLabel}）超时未审核，已丢弃（${entry.key}）`);
+    }, entry.timeoutMs);
+    promptGuardReviews.set(entry.id, entry);
+    // 上限：防止有人用大量命中把审核列表和内存刷爆（超出按最旧的废弃）。
+    while (promptGuardReviews.size > PROMPT_GUARD_MAX_PENDING) {
+      const oldestId = promptGuardReviews.keys().next().value;
+      if (oldestId === undefined) break;
+      const victim = promptGuardReviews.get(oldestId);
+      promptGuardReviews.delete(oldestId);
+      if (!victim) continue;
+      clearTimeout(victim.timer);
+      appendActivity(`${victim.key} 【拦截审核】#${victim.id}（${victim.type === 'out' ? '出站' : '进线'}）审核队列已满，按废弃处理`);
+      log(`🛡️ 拦截审核队列超过 ${PROMPT_GUARD_MAX_PENDING} 条，#${victim.id} 按废弃处理`);
+    }
+    return entry;
+  }
+
+  async function decidePromptGuardReview(id, action, via = 'console') {
+    const entry = promptGuardReviews.get(id);
+    if (!entry) return { ok: false, error: '编号不存在，或已处理 / 已超时' };
+    clearTimeout(entry.timer);
+    promptGuardReviews.delete(id);
+    const viaLabel = via === 'qq' ? 'QQ 私聊' : '控制台';
+    const typeLabel = entry.type === 'out' ? '出站' : '进线';
+    if (action === 'discard') {
+      appendActivity(`${entry.key} 【拦截审核】#${id}（${typeLabel}）管理员已废弃（${viaLabel}）`);
+      log(`🛡️ 拦截审核 #${id}（${typeLabel}）已废弃（${viaLabel}）`);
+      return { ok: true, id, action, type: entry.type };
+    }
+    appendActivity(`${entry.key} 【拦截审核】#${id}（${typeLabel}）管理员已放行（${viaLabel}）：${entry.text.slice(0, 60)}`);
+    log(`🛡️ 拦截审核 #${id}（${typeLabel}）已放行（${viaLabel}）→ ${entry.key}`);
+    try {
+      if (entry.type === 'out') {
+        if (entry.source === 'tool') {
+          let replyTo = entry.replyToMessageId ?? null;
+          if (replyTo !== null && replyTo !== undefined && String(replyTo).trim() !== '') {
+            const resolved = await resolveReplyTargetV2(getSocialV2State(entry.key), entry.kind, entry.convId, String(replyTo).trim());
+            if (resolved) replyTo = resolved.messageId;
+          }
+          const messageList = entry.messages ?? [entry.text];
+          const delays = computeGapsV2(messageList, 'auto', undefined, undefined, cfg.socialV2?.send ?? {});
+          const sent = await sendMessagesV2(entry.key, messageList, delays, replyTo, entry.atUserId ?? null);
+          if (Array.isArray(sent) && sent.length) recordSentMessagesV2(entry.key, sent);
+        } else {
+          await sendToQQ(entry.key, entry.text);
+        }
+      } else {
+        // 用原事件重放：白名单/模式/会话状态都会重新校验，放行不等于绕过后续边界。
+        await handleIncoming(entry.kind, entry.convId, entry.event, cfg, { skipPromptGuard: true, reviewed: true });
+      }
+    } catch (error) {
+      log(`⚠️ 拦截审核 #${id} 放行后重新投递失败：${error?.message ?? error}`);
+      return { ok: false, id, action, error: `放行后投递失败：${error?.message ?? error}` };
+    }
+    return { ok: true, id, action, type: entry.type };
+  }
+
+  function dropPromptGuardReviewsFor(key, reason = '会话已重置') {
+    for (const [id, entry] of [...promptGuardReviews.entries()]) {
+      if (entry.key !== key) continue;
+      clearTimeout(entry.timer);
+      promptGuardReviews.delete(id);
+      appendActivity(`${entry.key} 【拦截审核】#${id} ${reason}，已丢弃`);
+    }
+  }
+
+  function dropAllPromptGuardReviews(reason = '工作区已清空') {
+    for (const [id, entry] of [...promptGuardReviews.entries()]) {
+      clearTimeout(entry.timer);
+      promptGuardReviews.delete(id);
+      appendActivity(`${entry.key} 【拦截审核】#${id} ${reason}，已丢弃`);
+    }
+  }
+
+  // ── 出站内容守卫（output guard） ─────────────────────────────────────────
+  // 判定见 src/output-guard.js。只拦 AI 自己写的出站文本；桥接通知/管理回执/
+  // 控制台测试发送不走这里（它们不经过 auditAndSend / sendMessagesV2 的检查点）。
+  function outputGuardCfg() {
+    return cfg.security?.outputGuard ?? OUTPUT_GUARD_DEFAULTS;
+  }
+
+  function outputGuardExempt(key) {
+    const og = outputGuardCfg();
+    return og.skipOwnerPrivate !== false && key === `private:${String(cfg.ownerQQ ?? '')}`;
+  }
+
+  function currentOutputFingerprint() {
+    const og = outputGuardCfg();
+    if (og.enabled === false || og.suspect?.fingerprint === false) return null;
+    const presetName = String(currentMode === 'reserved2'
+      ? (cfg.socialV2?.agentPreset || cfg.agentPreset || 'qq-chat-v2')
+      : (cfg.agentPreset || 'qq-chat'));
+    const roleState = readRoleState();
+    const cacheKey = `${presetName}|${currentMode}|${roleState.role ?? ''}`;
+    const now = Date.now();
+    if (outputFingerprintCache.key === cacheKey && now - outputFingerprintCache.builtAt < 60_000) {
+      return outputFingerprintCache.fp;
+    }
+    const sources = [];
+    try {
+      const { prefix } = readPresetPromptText(presetName);
+      if (prefix) sources.push(prefix);
+    } catch (error) {
+      log(`⚠️ 读取 preset 提示词失败（出站指纹暂不可用）：${error?.message ?? error}`);
+    }
+    try {
+      const roleText = roleHintForMode(currentMode === 'reserved2' ? 'v2' : 'v1');
+      if (roleText) sources.push(roleText);
+    } catch {}
+    const fp = buildPromptFingerprint(sources, { minChars: og.fingerprint?.minChars });
+    outputFingerprintCache = { key: cacheKey, fp, builtAt: now };
+    return fp;
+  }
+
+  function classifyOutboundText(text, og) {
+    const body = String(text ?? '');
+    const hasKnownToken = [...KNOWN_AGENT_TOKENS].some((t) => t && body.includes(t));
+    const sensitive = SENSITIVE_RE.test(body);
+    let hit = matchOutputGuard(body, og, { knownToken: hasKnownToken, sensitive });
+    if (!hit && og.suspect?.fingerprint !== false) {
+      const fingerprint = currentOutputFingerprint();
+      const matched = matchPromptFingerprint(body, fingerprint, og.fingerprint);
+      if (matched) {
+        hit = {
+          tier: 'suspect',
+          id: 'fingerprint',
+          category: 'fingerprint',
+          label: '提示词逐字复述',
+          evidence: `${matched.fragment}（${matched.count} 处）`
+        };
+      }
+    }
+    return hit;
+  }
+
+  function outputGuardVars(key, source, hit, action, extra = {}) {
+    const og = outputGuardCfg();
+    const timeoutMs = Number(extra.timeoutMs) > 0 ? Number(extra.timeoutMs) : (Number(og.reviewTimeoutMs) || 180000);
+    const minutes = Math.max(1, Math.round(timeoutMs / 60000));
+    const id = extra.id ?? '—';
+    const detail = action === 'review'
+      ? `编号 #${id}；控制台可放行/废弃，或私聊回复「放行 ${id}」/「废弃 ${id}」；${minutes} 分钟内不处理将丢弃。`
+      : action === 'block' ? '已直接拦截，不会发出。' : '仅记录，不拦截发送。';
+    return {
+      type: '出站',
+      id,
+      conv: key,
+      source: source === 'tool' ? '工具发送' : '自动转发',
+      rule: hit?.label ?? '—',
+      status: action === 'review' ? '待审核' : action === 'block' ? '已直接拦截' : '仅通知',
+      text: truncateText(String(extra.text ?? ''), 200),
+      detail,
+      minutes
+    };
+  }
+
+  function outputGuardNotify(key, source, hit, action, extra = {}) {
+    const og = outputGuardCfg();
+    const vars = outputGuardVars(key, source, hit, action, extra);
+    const now = Date.now();
+    const emit = (target, notice, slot) => {
+      if (!notice || notice.enabled !== true) return;
+      const template = String(notice.template ?? '').trim();
+      if (!template) return;
+      const cooldown = Math.max(0, Number(notice.cooldownMs) || 0);
+      if (cooldown > 0 && now - (outputGuardNotifyAt.get(slot) ?? 0) < cooldown) return;
+      outputGuardNotifyAt.set(slot, now);
+      const text = sanitizeGuardNotice(renderPromptGuardTemplate(template, vars));
+      if (!text) return;
+      sendToQQ(target, text).catch((error) => log(`出站守卫通知发送失败（${target}）：${error?.message ?? error}`));
+    };
+    if (cfg.ownerQQ) emit(`private:${cfg.ownerQQ}`, og.notifyOwner, 'og-owner');
+    // 群内只在高危直接拦截时提示；暂扣/仅通知不惊动群里。
+    // security.interceptNotify=false 是旧版“一律不在群里提示”的开关，作为否决位保留。
+    if (action === 'block' && String(key).startsWith('group:') && cfg.security?.interceptNotify !== false) {
+      emit(key, og.notifyGroup, `og-group:${key}`);
+    }
+  }
+
+  function notifyOutputBreaker(key, hit, pause) {
+    const og = outputGuardCfg();
+    if (!pause || og.breaker?.notifyOwner === false || !cfg.ownerQQ) return;
+    const now = Date.now();
+    if (now - (outputGuardNotifyAt.get('og-breaker') ?? 0) < 30_000) return;
+    outputGuardNotifyAt.set('og-breaker', now);
+    const template = String(og.breaker.template ?? '').trim();
+    if (!template) return;
+    const vars = {
+      conv: key,
+      minutes: Math.max(1, Math.round((pause.windowMs || 0) / 60000)),
+      hits: pause.hits,
+      rule: pause.lastRule || hit?.label || '—',
+      pauseMinutes: Math.max(1, Math.round((pause.pauseMs || 0) / 60000))
+    };
+    const text = sanitizeGuardNotice(renderPromptGuardTemplate(template, vars));
+    if (text) sendToQQ(`private:${cfg.ownerQQ}`, text).catch((error) => log(`熔断通知发送失败：${error?.message ?? error}`));
+  }
+
+  /**
+   * 出站统一闸门。返回 { action: 'pass' | 'notify' | 'review' | 'block' | 'paused' }。
+   * 'notify' 表示放行但已告警；review/block/paused 调用方必须放弃发送。
+   */
+  function screenOutbound(key, text, { source = 'auto', messages = null, replyToMessageId = null, atUserId = null } = {}) {
+    const og = outputGuardCfg();
+    const body = String(text ?? '');
+    const hasKnownToken = [...KNOWN_AGENT_TOKENS].some((t) => t && body.includes(t));
+    const sensitive = SENSITIVE_RE.test(body);
+    // 关闭出站守卫**不会**关掉既有的路径/凭据审计：那是独立的安全基线，不能靠一个开关绕过。
+    if (og.enabled === false) {
+      if (outputGuardExempt(key)) return { action: 'pass' };
+      if (!hasKnownToken && !sensitive) return { action: 'pass' };
+      const legacyHit = {
+        tier: 'hard',
+        id: 'credentials',
+        category: 'credentials',
+        label: hasKnownToken ? '已知会话令牌' : '路径/凭据',
+        evidence: ''
+      };
+      appendActivity(`${key} 【出站拦截】既有凭据审计命中（${legacyHit.label}）`);
+      log(`🛡️ 出站拦截（凭据审计，守卫已关闭）${key}：${legacyHit.label}`);
+      return { action: 'block', hit: legacyHit, legacy: true };
+    }
+    if (outputGuardExempt(key)) return { action: 'pass' };
+    const pause = outputGuardBreaker.paused(key);
+    if (pause) {
+      appendActivity(`${key} 【出站熔断】暂停发送中，本条已丢弃`);
+      log(`🛡️ 出站熔断中，丢弃 ${key} 的一条发送（剩余 ${Math.ceil(pause.remainingMs / 1000)}s）`);
+      return { action: 'paused', pause };
+    }
+    const hit = classifyOutboundText(body, og);
+    if (!hit) return { action: 'pass' };
+    const counts = hit.tier === 'hard' ? og.breaker?.countHard !== false : og.breaker?.countSuspect !== false;
+    const triggered = counts ? outputGuardBreaker.record(key, hit.label, og.breaker) : null;
+    const action = og.action === 'notify'
+      ? 'notify'
+      : (hit.tier === 'hard' || og.action === 'block' ? 'block' : 'review');
+    const entry = {
+      type: 'out',
+      key,
+      kind: key.split(':')[0],
+      convId: key.split(':')[1] ?? '',
+      text: body,
+      messages: messages ?? [body],
+      replyToMessageId,
+      atUserId,
+      source,
+      hit,
+      rule: hit.label,
+      sender: 'AI',
+      userId: '',
+      timeoutMs: Math.max(1000, Number(og.reviewTimeoutMs) || 0)
+    };
+    if (action === 'review') registerPromptGuardReview(entry);
+    appendActivity(`${key} 【出站拦截】${action === 'review' ? '暂扣审核' : action === 'block' ? '直接拦截' : '仅通知'}（${source === 'tool' ? '工具发送' : '自动转发'}）：${hit.label}｜${truncateText(body, 60)}`);
+    log(`🛡️ 出站${action === 'review' ? '暂扣' : action === 'block' ? '拦截' : '告警'} ${key} 命中 ${hit.label}（${hit.evidence}）`);
+    outputGuardNotify(key, source, hit, action, { id: entry.id, text: body, timeoutMs: entry.timeoutMs });
+    if (action === 'block') {
+      const reply = String(og.blockedReply ?? '').trim();
+      if (reply) sendToQQ(key, reply).catch((error) => log(`出站拦截提示发送失败：${error?.message ?? error}`));
+    }
+    if (triggered) notifyOutputBreaker(key, hit, triggered);
+    return { action, hit, reviewId: entry.id, triggered };
+  }
+
+  function screenOutboundBatch(key, messages, meta = {}) {
+    return screenOutbound(key, messages.join('\n'), { ...meta, source: meta.source ?? 'tool', messages });
   }
 
   // ── 真人式分条发送 ──────────────────────────────────────────────────────
@@ -8292,13 +8819,12 @@ async function main() {
     return roleState.mode === 'silent' && key !== `private:${String(cfg.ownerQQ ?? '')}`;
   }
 
-  // 统一出站消息：先完整文本审计，再发送。返回是否真的发出。
+  // 统一出站消息：先过输出守卫（高危/疑似/熔断），再发送。返回是否真的发出。
   async function auditAndSend(key, text) {
-    const hasKnownToken = [...KNOWN_AGENT_TOKENS].some((t) => t && String(text ?? '').includes(t));
-    if (shouldAuditKey(key) && (SENSITIVE_RE.test(text) || hasKnownToken)) {
-      log(`⚠️ 回复被安全策略拦截 (${key})，疑似包含敏感信息${hasKnownToken ? '（含会话令牌）' : ''}`);
-      appendActivity(`${key} agent 回复被拦截（疑似敏感信息${hasKnownToken ? '/会话令牌' : ''}）`);
-      if (cfg.security?.interceptNotify !== false) {
+    const screened = screenOutbound(key, text, { source: 'auto' });
+    if (screened.action === 'block' || screened.action === 'review' || screened.action === 'paused') {
+      // 守卫关闭时仍生效的既有凭据审计：沿用旧提示（群内），其它情况由 screenOutbound 通知。
+      if (screened.legacy && cfg.security?.interceptNotify !== false) {
         await sendToQQ(key, '⚠️ 本条回复因疑似包含敏感信息（路径/凭据/会话令牌）被安全策略拦截，已记录并通知管理员。');
       }
       return false;
@@ -11056,7 +11582,7 @@ async function main() {
   }
 
   // QQ 消息 → DSH prompt
-  async function handleIncoming(kind, id, event, cfg) {
+  async function handleIncoming(kind, id, event, cfg, opts = {}) {
     const key = convKey(kind, id);
     if (!modeAllowed(key, kind, id, cfg, currentMode)) {
       log(`忽略未授权会话 ${key}（当前模式 ${currentMode}，来自 ${event.user_id}）`);
@@ -11109,6 +11635,75 @@ async function main() {
       return;
     }
 
+    // 🛡️ 关键词攻击防御（提示注入/越权诱导，见 src/prompt-guard.js）。
+    // 与系统指令屏蔽一样在“待应答、静默、管理命令”之前：命中即不进入未读队列 / 上下文 /
+    // 黑话窗口，模型看不到。区别是默认暂扣等管理员审核，而不是直接丢弃。
+    if (opts?.skipPromptGuard !== true) {
+      const guardCfg = cfg.security?.promptGuard ?? effectivePromptGuard();
+      if (guardCfg.enabled !== false && !(isOwner && guardCfg.skipOwner !== false)) {
+        let hit = matchPromptGuard(plainContent, guardCfg);
+        let source = 'message';
+        if (!hit && textContent && textContent !== plainContent) {
+          // 引用原文同样会进模型上下文：正文没中、引用里中了也要拦。
+          const quoted = matchPromptGuard(textContent, guardCfg);
+          if (quoted) { hit = quoted; source = 'quote'; }
+        }
+        if (hit) {
+          const action = guardCfg.action === 'discard' ? 'discard' : 'review';
+          const configuredTimeout = Number(guardCfg.reviewTimeoutMs);
+          const entry = {
+            key,
+            kind,
+            convId: String(id),
+            event,
+            hit,
+            source,
+            text: plainContent || textContent,
+            sender: String(event.sender?.card || event.sender?.nickname || event.user_id || '未知'),
+            userId: String(event.user_id ?? ''),
+            rule: source === 'quote' ? `${hit.label}（引用内容）` : hit.label,
+            timeoutMs: Number.isFinite(configuredTimeout) && configuredTimeout > 0
+              ? configuredTimeout
+              : PROMPT_GUARD_DEFAULTS.reviewTimeoutMs
+          };
+          appendActivity(`${key} 【关键词拦截】${isOwner ? '管理员' : '群友'} ${event.user_id} 命中 ${entry.rule}：${entry.text.slice(0, 60)}`);
+          log(`🛡️ 关键词拦截 ${key} ${event.user_id} 命中 ${entry.rule}（${action === 'review' ? '待审核' : '直接丢弃'}）：${entry.text.slice(0, 60)}`);
+          if (action === 'review') {
+            registerPromptGuardReview(entry);
+          } else {
+            // 直接废弃也分配编号：日志与群/私信模板里的 {id} 才有意义。
+            promptGuardSeq += 1;
+            entry.id = promptGuardSeq;
+            entry.at = Date.now();
+            entry.expiresAt = entry.at;
+          }
+          notifyPromptGuard(entry, action);
+          return;
+        }
+      }
+    }
+
+    // 管理员私聊口令：放行 12 / 废弃 #12（必须带编号，避免和 DSH 审批的「通过/拒绝」打架）。
+    if (isOwner && kind === 'private') {
+      const breakerCommand = parseBreakerCommand(plainContent);
+      if (breakerCommand) {
+        outputGuardBreaker.reset();
+        log('管理员私聊：已解除出站熔断');
+        await sendToQQ(key, '✅ 已解除熔断，恢复发送。');
+        return;
+      }
+      const command = parsePromptGuardCommand(plainContent);
+      if (command) {
+        const result = await decidePromptGuardReview(command.id, command.action, 'qq');
+        await sendToQQ(key, result.ok
+          ? (command.action === 'allow'
+            ? `✅ 已放行 #${command.id}${result.type === 'out' ? '（出站消息已发出）' : '，消息已重新交给 AI 处理'}`
+            : `🗑️ 已废弃 #${command.id}`)
+          : `❌ ${result.error ?? '处理失败'}`);
+        return;
+      }
+    }
+
     // 若该会话有挂起的提问/审批，先当作回答处理（用当前消息自己的文字，不含引用原文）。
     // 审批只有管理员消息会被消费；群友消息不能因为“审批挂起”而被吞掉，应继续走正常处理。
     const p = pending.get(key);
@@ -11158,6 +11753,8 @@ async function main() {
             cancelPendingEntry(pe).catch(() => {});
           }
           pending.delete(key);
+          // 待审核的拦截项跟着会话一起作废：否则放行时会凭空建出一个新会话。
+          dropPromptGuardReviewsFor(key);
           queued.delete(key);
           queuedHintAt.delete(key);
           sessionPromises.delete(key);
@@ -11841,21 +12438,17 @@ async function main() {
                   }
                   continue;
                 }
-                // 审计（对完整文本执行，避免截断漏判；这里只判断，不发送，避免双重发送）
-                const hasKnownToken = [...KNOWN_AGENT_TOKENS].some((t) => t && plain.includes(t));
-                if (shouldAuditKey(key) && (SENSITIVE_RE.test(plain) || hasKnownToken)) {
-                  log(`⚠️ 回复被安全策略拦截 (${key})，疑似包含敏感信息${hasKnownToken ? '（含会话令牌）' : ''}`);
-                  appendActivity(`${key} agent 回复被拦截（疑似敏感信息${hasKnownToken ? '/会话令牌' : ''}）`);
-                  if (cfg.security?.interceptNotify !== false) {
-                    await sendToQQ(key, '⚠️ 本条回复因疑似包含敏感信息（路径/凭据/会话令牌）被安全策略拦截，已记录并通知管理员。');
-                  }
+                // 出站守卫（对完整文本执行，避免截断漏判）：高危直接拦、疑似暂扣审核、熔断静默。
+                // 这里只判定与通知，真正发送仍在下面的分支里，避免双重发送。
+                const screened = screenOutbound(key, plain, { source: 'auto' });
+                if (screened.action === 'block' || screened.action === 'review' || screened.action === 'paused') {
                   if (isFarewell) {
                     const st = socialState(key);
                     if (st.phase === 'exiting') {
                       st.phase = 'idle';
                       st.activeDeadlineAt = 0;
                       st.activeExitAt = 0;
-                      log(`社交模式：${key} 退场发言被拦截，回到观望`);
+                      log(`社交模式：${key} 退场发言被出站守卫拦下，回到观望`);
                     }
                   }
                   continue;

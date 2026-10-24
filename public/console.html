@@ -850,8 +850,13 @@ tr:last-child td {
   background:var(--pill-red-bg);
   color:var(--pill-red-fg)
 }
-#sessionList,#pendingList {
+#sessionList,#pendingList,#pgReviewList {
   overflow:auto
+}
+#pgReviewList .pg-cell {
+  max-width:340px;
+  white-space:pre-wrap;
+  word-break:break-word
 }
 .tool-log-table,.slang-scroll {
   overflow:auto;
@@ -1304,6 +1309,9 @@ tr:last-child td {
   }
   #pendingList table {
     min-width:420px
+  }
+  #pgReviewList table {
+    min-width:720px
   }
   .slang-tabs {
     gap:0
@@ -2482,7 +2490,7 @@ button:active:not(:disabled) {
         <button id="secSave" class="small">保存安全设置</button>
         <span class="meta" id="secMsg"></span>
       </div>
-      <div class="meta">开启：回复被安全拦截时会在群里提示；关闭：直接沉默，只在日志/活动记录里留下记录。</div>
+      <div class="meta">旧版总开关：关闭后<b>一律不在群里</b>发拦截提示（出站群内提示还要在「回复安全（输出端）」里单独勾选）；开启只代表“允许提示”，不会自己打开某个面板的通知。</div>
       <div id="stateDirWarn" style="display:none;margin-top:10px;padding:8px 10px;border-left:3px solid var(--warn,#d08700);background:rgba(208,135,0,.08)">
         <b>⚠️ state/ 目录权限未收紧</b>
         <div class="meta" style="margin:4px 0">Windows 上改文件权限需要管理员身份，本次启动没能收紧 <code id="stateDirPath"></code>。它里面的控制台令牌、SnowLuma 令牌、各会话令牌与 QQ 聊天记录，本机任何已登录用户都可能读到。</div>
@@ -2526,6 +2534,184 @@ button:active:not(:disabled) {
         <span class="meta" id="cmdShieldSlMsg"></span>
       </div>
       <div class="meta">这条回复由 SnowLuma 自己发（版本 / 平台 / 运行时长），绕过桥接审计；关闭后需<b>重启 SnowLuma</b> 生效。改前自动备份到 <code>state/command-shield-backups/</code>。</div>
+    </section>
+<section id="section-prompt-guard" data-page="access" class="card span-all">
+      <h2 data-note="进线拦截，模型看不到">关键词攻击防御</h2>
+      <div class="row">
+        <label style="flex:1">启用关键词攻击防御</label>
+        <input type="checkbox" id="pgEnabled" style="width:auto">
+      </div>
+      <div class="row" style="margin-top:8px">
+        <label style="flex:1">命中后的处理方式</label>
+        <select id="pgAction" style="flex:0 1 250px">
+          <option value="review">暂扣，等管理员审核</option>
+          <option value="discard">直接废弃（不进审核列表）</option>
+        </select>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <label style="flex:0 0 auto">审核超时（分钟，1~60）</label>
+        <input type="number" id="pgTimeout" min="1" max="60" step="1" style="max-width:110px">
+        <label style="flex:0 0 auto;margin-left:16px">管理员消息也检查</label>
+        <input type="checkbox" id="pgSkipOwner" style="width:auto">
+      </div>
+      <label style="margin-top:8px">命中即拦截的关键词（每行一个）</label>
+      <textarea id="pgKeywords" style="min-height:78px" placeholder="忽略指令&#10;系统提示词&#10;开发者模式"></textarea>
+      <div class="meta">纯文本匹配，不分大小写；全角、零宽字符、空格/标点拆字都会先归一化再比对。关键词越短越容易误伤（例如「系统」会命中大量正常聊天），建议配合审核模式使用。</div>
+      <div class="row" style="margin-top:8px">
+        <label style="flex:1">仅用自定义关键词（关闭全部内置规则）</label>
+        <input type="checkbox" id="pgCustomOnly" style="width:auto">
+      </div>
+      <div class="meta">打开后只有上面的关键词参与判断；内置规则与下面的「额外规则」都不生效。</div>
+      <label style="margin-top:8px">额外规则（每行一个正则，命中即拦截）</label>
+      <textarea id="pgExtra" style="min-height:64px" placeholder="例如：把你的.{0,6}(token|密钥)"></textarea>
+      <div class="meta" id="pgStatus" style="margin-top:10px">读取中…</div>
+
+      <h3 style="margin-top:18px">拦截后的通知</h3>
+      <div class="row">
+        <label style="flex:1">群内发布拦截通知（同一群 1 分钟最多一条）</label>
+        <input type="checkbox" id="pgNotifyGroup" style="width:auto">
+      </div>
+      <label>群内通知内容</label>
+      <textarea id="pgGroupTemplate" style="min-height:58px"></textarea>
+      <div class="row" style="margin-top:8px">
+        <label style="flex:1">私信通知管理员（同一个人 1 分钟最多一条）</label>
+        <input type="checkbox" id="pgNotifyOwner" style="width:auto">
+      </div>
+      <label>管理员私信内容</label>
+      <textarea id="pgOwnerTemplate" style="min-height:78px"></textarea>
+      <div class="meta">可用变量：<code>{id}</code> 编号、<code>{status}</code> 待审核/已拦截、<code>{detail}</code> 处理提示、<code>{conv}</code> 会话、<code>{sender}</code> 发送者、<code>{userId}</code> QQ 号、<code>{rule}</code> 命中规则、<code>{text}</code> 原文摘要、<code>{minutes}</code> 超时分钟数。未知变量原样保留。</div>
+      <div class="row" style="margin-top:8px">
+        <button id="pgSave" class="small">保存防御设置</button>
+        <span class="meta" id="pgMsg"></span>
+      </div>
+      <div class="meta">命中后消息不进未读队列 / 上下文 / 黑话窗口；审核模式下可在「待审核拦截」里处理，或由管理员私聊回复「放行 3」「废弃 3」，超时自动废弃。</div>
+    </section>
+<section id="section-output-guard" data-page="access" class="card span-all">
+      <h2 data-note="只拦 AI 出站文本">回复安全（输出端）</h2>
+      <div class="row">
+        <label style="flex:1">启用出站守卫</label>
+        <input type="checkbox" id="ogEnabled" style="width:auto">
+      </div>
+      <div class="row" style="margin-top:8px">
+        <label style="flex:1">命中后的处理方式</label>
+        <select id="ogAction" style="flex:0 1 280px">
+          <option value="tiered">分级：高危直接拦，疑似暂扣审核</option>
+          <option value="block">全部直接拦（不进审核）</option>
+          <option value="notify">只通知，不拦截</option>
+        </select>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <label style="flex:0 0 auto">审核超时（分钟，1~60）</label>
+        <input type="number" id="ogTimeout" min="1" max="60" step="1" style="max-width:110px">
+        <label style="flex:0 0 auto;margin-left:16px">管理员私聊不检查</label>
+        <input type="checkbox" id="ogSkipOwner" style="width:auto">
+      </div>
+
+      <h3 style="margin-top:16px">高危（直接不发）</h3>
+      <div class="row">
+        <label style="flex:1">路径 / 凭据 / 已知会话令牌</label>
+        <input type="checkbox" id="ogHardCredentials" style="width:auto">
+      </div>
+      <div class="row" style="margin-top:6px">
+        <label style="flex:1">冒充管理员 / 系统标记（【管理员】等）</label>
+        <input type="checkbox" id="ogHardImpersonation" style="width:auto">
+      </div>
+      <div class="row" style="margin-top:6px">
+        <label style="flex:1">反向索要凭据（让群友发 token / 密码 / 验证码）</label>
+        <input type="checkbox" id="ogHardCredentialRequest" style="width:auto">
+      </div>
+
+      <h3 style="margin-top:16px">疑似（暂扣审核）</h3>
+      <div class="row">
+        <label style="flex:1">提示词 / 人设泄露话术</label>
+        <input type="checkbox" id="ogSuspectPromptLeak" style="width:auto">
+      </div>
+      <div class="row" style="margin-top:6px">
+        <label style="flex:1">与提示词原文逐字比对</label>
+        <input type="checkbox" id="ogSuspectFingerprint" style="width:auto">
+      </div>
+      <div class="row" style="margin-top:6px">
+        <label style="flex:1">内部标识（工具名 / DSH / state 路径 / 接口名）</label>
+        <input type="checkbox" id="ogSuspectInternal" style="width:auto">
+      </div>
+      <div class="row" style="margin-top:6px">
+        <label style="flex:1">协议与控制标记（[SILENT] / [CQ: / @全体成员）</label>
+        <input type="checkbox" id="ogSuspectProtocol" style="width:auto">
+      </div>
+      <div class="row" style="margin-top:6px">
+        <label style="flex:1">自定义关键词 / 正则</label>
+        <input type="checkbox" id="ogSuspectCustom" style="width:auto">
+      </div>
+
+      <label style="margin-top:8px">命中即拦截的关键词（每行一个）</label>
+      <textarea id="ogKeywords" style="min-height:64px"></textarea>
+      <label style="margin-top:8px">额外规则（每行一个正则）</label>
+      <textarea id="ogExtra" style="min-height:56px"></textarea>
+      <div class="row" style="margin-top:8px">
+        <label style="flex:0 0 auto">逐字比对窗口（字）</label>
+        <input type="number" id="ogFingerprintMin" min="8" max="40" step="1" style="max-width:90px">
+        <label style="flex:0 0 auto;margin-left:12px">最少命中</label>
+        <input type="number" id="ogFingerprintHits" min="1" max="10" step="1" style="max-width:80px">
+      </div>
+      <div class="meta" id="ogStatus" style="margin-top:10px">读取中…</div>
+
+      <h3 style="margin-top:16px">拦截后的通知</h3>
+      <div class="row">
+        <label style="flex:1">群内发布拦截通知（仅高危直接拦；同一群 1 分钟最多一条）</label>
+        <input type="checkbox" id="ogNotifyGroup" style="width:auto">
+      </div>
+      <label>群内通知内容</label>
+      <textarea id="ogGroupTemplate" style="min-height:54px"></textarea>
+      <div class="row" style="margin-top:8px">
+        <label style="flex:1">私信通知管理员（同一人 1 分钟最多一条）</label>
+        <input type="checkbox" id="ogNotifyOwner" style="width:auto">
+      </div>
+      <label>管理员私信内容</label>
+      <textarea id="ogOwnerTemplate" style="min-height:64px"></textarea>
+      <div class="meta">可用变量：<code>{id}</code> 编号、<code>{type}</code> 出站、<code>{conv}</code> 会话、<code>{source}</code> 自动转发/工具发送、<code>{rule}</code> 命中规则、<code>{status}</code> 待审核/已直接拦截、<code>{text}</code> 原文摘要、<code>{detail}</code> 处理提示、<code>{minutes}</code> 超时分钟数。</div>
+      <label>高危拦截时给会话发一句固定提示（留空 = 不发）</label>
+      <textarea id="ogBlockedReply" style="min-height:44px"></textarea>
+
+      <h3 style="margin-top:16px">熔断</h3>
+      <div class="row">
+        <label style="flex:1">连续命中后暂停该会话的出站</label>
+        <input type="checkbox" id="ogBreakerEnabled" style="width:auto">
+      </div>
+      <div class="row" style="margin-top:8px">
+        <label style="flex:0 0 auto">阈值（次）</label>
+        <input type="number" id="ogBreakerThreshold" min="1" max="50" style="max-width:80px">
+        <label style="flex:0 0 auto;margin-left:12px">窗口（分钟）</label>
+        <input type="number" id="ogBreakerWindow" min="1" max="1440" style="max-width:90px">
+        <label style="flex:0 0 auto;margin-left:12px">暂停（分钟）</label>
+        <input type="number" id="ogBreakerPause" min="1" max="1440" style="max-width:90px">
+      </div>
+      <div class="row" style="margin-top:8px">
+        <label style="flex:0 0 auto">范围</label>
+        <select id="ogBreakerScope" style="flex:0 1 150px">
+          <option value="conversation">按会话</option>
+          <option value="global">全局</option>
+        </select>
+        <label style="flex:0 0 auto;margin-left:12px">高危计数</label>
+        <input type="checkbox" id="ogBreakerCountHard" style="width:auto">
+        <label style="flex:0 0 auto;margin-left:12px">疑似计数</label>
+        <input type="checkbox" id="ogBreakerCountSuspect" style="width:auto">
+      </div>
+      <div class="row" style="margin-top:8px">
+        <button id="ogBreakerReset" class="small danger">解除熔断</button>
+        <span class="meta" id="ogBreakerMsg"></span>
+      </div>
+      <div class="meta" id="ogBreakerStatus">读取中…</div>
+
+      <div class="row" style="margin-top:10px">
+        <button id="ogSave" class="small">保存出站守卫</button>
+        <span class="meta" id="ogMsg"></span>
+      </div>
+      <div class="meta">只检查 AI 自己写的出站文本（自动转发 + 二代工具发送）；桥接通知、管理回执、控制台测试发送不受影响。审核放行后会按原目标补发；熔断状态只在内存，重启即恢复。</div>
+    </section>
+<section id="section-guard-reviews" data-page="access" class="card span-all">
+      <h2 data-note="进线 / 出站统一编号">待审核拦截</h2>
+      <div class="meta" id="pgReviewMeta">加载中…</div>
+      <div id="pgReviewList"></div>
     </section>
 <section id="section-token" data-page="access" class="card">
       <h2>控制台访问令牌</h2>
@@ -4442,6 +4628,9 @@ function loadSecurity() {
     document.getElementById('cmdShieldCooldown').value = Math.round((Number(cs.notifyCooldownMs) || 0) / 60000);
     document.getElementById('cmdShieldExtra').value = Array.isArray(cs.extraPatterns) ? cs.extraPatterns.join('\n') : '';
     renderCmdShieldSnowluma(r.snowlumaStatus);
+    renderPromptGuard(r.security?.promptGuard);
+    outputGuardCache = r.security?.outputGuard || null;
+    renderOutputGuard(outputGuardCache);
     // state/ 的 ACL 是否收紧（Windows 上需要管理员权限，未提权时会失败）。
     // 明确警示 + 给出可复制的命令，而不是让用户以为已经安全。
     const warn = document.getElementById('stateDirWarn');
@@ -4511,6 +4700,292 @@ document.getElementById('stateDirReharden').addEventListener('click', async () =
   msg.textContent = r.hardened === true ? '✅ 权限已收紧' : '❌ 仍未收紧（改 ACL 需要管理员权限；请按上面两种做法之一操作后复检）';
   msg.className = r.hardened === true ? 'meta ok' : 'meta err';
   loadSecurity();
+});
+
+// ── 关键词攻击防御（prompt guard） ─────────────────────────────────────────
+function promptGuardLines(value) {
+  return String(value || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+}
+
+function renderPromptGuardStatus(pg) {
+  const el = document.getElementById('pgStatus');
+  if (!el) return;
+  const keywords = Array.isArray(pg?.keywords) ? pg.keywords : [];
+  const extra = Array.isArray(pg?.extraPatterns) ? pg.extraPatterns : [];
+  const warns = [];
+  let text;
+  if (pg?.enabled === false) {
+    text = '当前：已关闭，命中也不拦截。';
+  } else if (pg?.customOnly === true) {
+    text = `当前生效：仅自定义关键词（${keywords.length} 条）；内置规则与额外正则都不参与判断。`;
+    if (keywords.length === 0) warns.push('关键词列表为空，现在不会拦截任何消息');
+    if (extra.length > 0) warns.push('额外正则在当前模式下不生效');
+  } else {
+    text = `当前生效：内置规则 + 关键词（${keywords.length} 条）+ 正则（${extra.length} 条）。`;
+  }
+  el.textContent = warns.length ? `${text} ⚠️ ${warns.join('；')}。` : text;
+  el.className = warns.length ? 'meta err' : 'meta';
+}
+
+function renderPromptGuard(pg) {
+  const setValue = (id, value) => { const el = document.getElementById(id); if (el) el.value = value; };
+  document.getElementById('pgEnabled').checked = pg?.enabled !== false;
+  document.getElementById('pgAction').value = pg?.action === 'discard' ? 'discard' : 'review';
+  const minutes = Math.max(1, Math.min(60, Math.round((Number(pg?.reviewTimeoutMs) || 300000) / 60000)));
+  setValue('pgTimeout', String(minutes));
+  document.getElementById('pgSkipOwner').checked = pg?.skipOwner === false;
+  setValue('pgKeywords', (Array.isArray(pg?.keywords) ? pg.keywords : []).join('\n'));
+  document.getElementById('pgCustomOnly').checked = pg?.customOnly === true;
+  setValue('pgExtra', (Array.isArray(pg?.extraPatterns) ? pg.extraPatterns : []).join('\n'));
+  document.getElementById('pgNotifyGroup').checked = pg?.notifyGroup?.enabled === true;
+  setValue('pgGroupTemplate', pg?.notifyGroup?.template || '');
+  document.getElementById('pgNotifyOwner').checked = pg?.notifyOwner?.enabled !== false;
+  setValue('pgOwnerTemplate', pg?.notifyOwner?.template || '');
+  renderPromptGuardStatus(pg);
+}
+
+function promptGuardRemaining(ms) {
+  const seconds = Math.max(0, Math.ceil(Number(ms) / 1000));
+  if (seconds >= 60) return `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`;
+  return `${seconds} 秒`;
+}
+
+async function refreshPromptGuardReviews() {
+  const box = document.getElementById('pgReviewList');
+  if (!box) return;
+  let r;
+  try { r = await api('/api/prompt-guard/reviews'); } catch { return; }
+  const meta = document.getElementById('pgReviewMeta');
+  const list = Array.isArray(r?.reviews) ? r.reviews : [];
+  const outCount = list.filter(x => x.type === 'out').length;
+  const inCount = list.length - outCount;
+  if (!list.length) {
+    meta.textContent = '当前没有待审核的拦截。';
+  } else {
+    meta.textContent = `待审核 ${list.length} 条（进线 ${inCount} / 出站 ${outCount}；队列上限 ${r?.max || 50} 条，超时自动废弃）。`;
+  }
+  if (!list.length) {
+    box.innerHTML = '<div class="empty-state"><strong>没有待审核的拦截</strong><p>命中关键词的进线消息、被暂扣的 AI 回复都会出现在这里，由你决定放行还是废弃。</p></div>';
+    return;
+  }
+  const now = Date.now();
+  let html = '<table><tr><th>类型</th><th>#</th><th>时间</th><th>会话</th><th>来源</th><th>命中</th><th>原文</th><th>剩余</th><th>处理</th></tr>';
+  for (const item of list) {
+    const isOut = item.type === 'out';
+    const time = new Date(Number(item.at) || now).toLocaleTimeString('zh-CN', { hour12: false });
+    const remain = Math.max(0, (Number(item.expiresAt) || now) - now);
+    const typePill = isOut ? '<span class="pill r">出站</span>' : '<span class="pill b">进线</span>';
+    const source = isOut
+      ? (item.source === 'tool' ? 'AI · 工具发送' : 'AI · 自动转发')
+      : `${item.sender}（${item.userId}）`;
+    html += `<tr><td>${typePill}</td><td>#${esc(item.id)}</td><td>${esc(time)}</td><td>${esc(item.key)}</td>`
+      + `<td>${esc(source)}</td><td>${esc(item.rule)}</td>`
+      + `<td class="pg-cell">${esc(item.text)}</td><td>${esc(promptGuardRemaining(remain))}</td>`
+      + `<td><button class="small" data-pg-allow="${esc(item.id)}">放行</button> <button class="small danger" data-pg-discard="${esc(item.id)}">废弃</button></td></tr>`;
+  }
+  box.innerHTML = html + '</table>';
+}
+
+document.getElementById('pgSave').addEventListener('click', async () => {
+  const msg = document.getElementById('pgMsg');
+  const raw = document.getElementById('pgTimeout').value.trim();
+  const minutes = raw === '' ? NaN : Number(raw);
+  if (!Number.isFinite(minutes) || minutes < 1 || minutes > 60) {
+    msg.textContent = '❌ 审核超时需在 1~60 分钟之间';
+    msg.className = 'meta err';
+    return;
+  }
+  msg.textContent = '保存中…';
+  msg.className = 'meta';
+  const r = await api('/api/security', 'POST', {
+    promptGuard: {
+      enabled: document.getElementById('pgEnabled').checked,
+      action: document.getElementById('pgAction').value,
+      reviewTimeoutMs: Math.round(minutes) * 60000,
+      skipOwner: !document.getElementById('pgSkipOwner').checked,
+      customOnly: document.getElementById('pgCustomOnly').checked,
+      keywords: promptGuardLines(document.getElementById('pgKeywords').value),
+      extraPatterns: promptGuardLines(document.getElementById('pgExtra').value),
+      notifyGroup: {
+        enabled: document.getElementById('pgNotifyGroup').checked,
+        template: document.getElementById('pgGroupTemplate').value
+      },
+      notifyOwner: {
+        enabled: document.getElementById('pgNotifyOwner').checked,
+        template: document.getElementById('pgOwnerTemplate').value
+      }
+    }
+  });
+  msg.textContent = r.ok ? '✅ 已保存（立即生效）' : ('❌ ' + (r.error || '保存失败'));
+  msg.className = r.ok ? 'meta ok' : 'meta err';
+  if (r.ok) {
+    renderPromptGuard(r.promptGuard || r.security?.promptGuard || {});
+    refreshPromptGuardReviews();
+  }
+});
+
+document.getElementById('pgReviewList').addEventListener('click', async (event) => {
+  const target = event.target instanceof Element ? event.target.closest('[data-pg-allow],[data-pg-discard]') : null;
+  if (!target) return;
+  const allow = target.hasAttribute('data-pg-allow');
+  const id = Number(allow ? target.dataset.pgAllow : target.dataset.pgDiscard);
+  if (!Number.isInteger(id) || id <= 0) return;
+  if (!allow && !confirm(`确定废弃 #${id} 吗？该消息不会交给 AI。`)) return;
+  const r = await api('/api/prompt-guard/decide', 'POST', { id, action: allow ? 'allow' : 'discard' });
+  if (!r.ok) alert(r.error || '处理失败');
+  refreshPromptGuardReviews();
+});
+
+// ── 出站守卫（output guard）与熔断 ───────────────────────────────────────
+let outputGuardCache = null;
+
+function outputGuardSummary(og) {
+  if (!og) return '出站守卫：读取中…';
+  if (og.enabled === false) return '出站守卫：已关闭。';
+  const parts = [og.action === 'notify' ? '只通知' : og.action === 'block' ? '全部直接拦' : '分级：高危拦 / 疑似审核'];
+  if (og.suspect?.custom !== false) parts.push(`关键词 ${(og.keywords || []).length} 条`);
+  if (og.suspect?.custom !== false) parts.push(`正则 ${(og.extraPatterns || []).length} 条`);
+  if (og.suspect?.fingerprint !== false) parts.push(`逐字比对 ${og.fingerprint?.minChars || 14} 字`);
+  return `出站守卫：启用｜${parts.join('｜')}`;
+}
+
+function renderOutputGuard(og) {
+  const setValue = (id, value) => { const el = document.getElementById(id); if (el) el.value = value; };
+  const setChecked = (id, value) => { const el = document.getElementById(id); if (el) el.checked = value; };
+  const o = og || {};
+  setChecked('ogEnabled', o.enabled !== false);
+  setValue('ogAction', ['block', 'notify'].includes(o.action) ? o.action : 'tiered');
+  setValue('ogTimeout', String(Math.max(1, Math.min(60, Math.round((Number(o.reviewTimeoutMs) || 180000) / 60000)))));
+  setChecked('ogSkipOwner', o.skipOwnerPrivate !== false);
+  setChecked('ogHardCredentials', o.hard?.credentials !== false);
+  setChecked('ogHardImpersonation', o.hard?.impersonation !== false);
+  setChecked('ogHardCredentialRequest', o.hard?.credentialRequest !== false);
+  setChecked('ogSuspectPromptLeak', o.suspect?.promptLeak !== false);
+  setChecked('ogSuspectFingerprint', o.suspect?.fingerprint !== false);
+  setChecked('ogSuspectInternal', o.suspect?.internal !== false);
+  setChecked('ogSuspectProtocol', o.suspect?.protocol !== false);
+  setChecked('ogSuspectCustom', o.suspect?.custom !== false);
+  setValue('ogKeywords', (Array.isArray(o.keywords) ? o.keywords : []).join('\n'));
+  setValue('ogExtra', (Array.isArray(o.extraPatterns) ? o.extraPatterns : []).join('\n'));
+  setValue('ogFingerprintMin', String(o.fingerprint?.minChars || 14));
+  setValue('ogFingerprintHits', String(o.fingerprint?.minHits || 1));
+  setChecked('ogNotifyGroup', o.notifyGroup?.enabled === true);
+  setValue('ogGroupTemplate', o.notifyGroup?.template || '');
+  setChecked('ogNotifyOwner', o.notifyOwner?.enabled !== false);
+  setValue('ogOwnerTemplate', o.notifyOwner?.template || '');
+  setValue('ogBlockedReply', o.blockedReply || '');
+  setChecked('ogBreakerEnabled', o.breaker?.enabled !== false);
+  setValue('ogBreakerThreshold', String(o.breaker?.threshold || 5));
+  setValue('ogBreakerWindow', String(Math.max(1, Math.round((Number(o.breaker?.windowMs) || 600000) / 60000))));
+  setValue('ogBreakerPause', String(Math.max(1, Math.round((Number(o.breaker?.pauseMs) || 900000) / 60000))));
+  setValue('ogBreakerScope', o.breaker?.scope === 'global' ? 'global' : 'conversation');
+  setChecked('ogBreakerCountHard', o.breaker?.countHard !== false);
+  setChecked('ogBreakerCountSuspect', o.breaker?.countSuspect !== false);
+  const statusEl = document.getElementById('ogStatus');
+  if (statusEl) statusEl.textContent = outputGuardSummary(o);
+}
+
+async function refreshOutputGuardStatus() {
+  const statusEl = document.getElementById('ogStatus');
+  const breakerEl = document.getElementById('ogBreakerStatus');
+  if (!statusEl || !breakerEl) return;
+  let r;
+  try { r = await api('/api/output-guard/status'); } catch { return; }
+  const fp = r.fingerprint;
+  const fpText = fp ? `指纹库 ${fp.size} 段 / ${fp.chars} 字符` : '指纹库未建立';
+  statusEl.textContent = `${outputGuardSummary(outputGuardCache)}｜${fpText}｜待审核：出站 ${r.pendingOut ?? 0} / 进线 ${r.pendingIn ?? 0} 条`;
+  const b = r.breaker;
+  const resetBtn = document.getElementById('ogBreakerReset');
+  if (b) {
+    const remain = Math.max(0, Math.ceil((Number(b.remainingMs) || 0) / 1000));
+    breakerEl.textContent = `🔴 熔断中：${b.triggeredBy || b.scope}，剩余 ${Math.floor(remain / 60)} 分 ${remain % 60} 秒（${b.hits} 次命中，最近：${b.lastRule || '—'}）`;
+    breakerEl.className = 'meta err';
+    if (resetBtn) resetBtn.disabled = false;
+  } else {
+    breakerEl.textContent = '当前：未熔断。';
+    breakerEl.className = 'meta';
+    if (resetBtn) resetBtn.disabled = true;
+  }
+}
+
+document.getElementById('ogSave').addEventListener('click', async () => {
+  const msg = document.getElementById('ogMsg');
+  const timeoutMin = Number(document.getElementById('ogTimeout').value);
+  const breakerWindow = Number(document.getElementById('ogBreakerWindow').value);
+  const breakerPause = Number(document.getElementById('ogBreakerPause').value);
+  if (!Number.isFinite(timeoutMin) || timeoutMin < 1 || timeoutMin > 60) {
+    msg.textContent = '❌ 审核超时需在 1~60 分钟之间';
+    msg.className = 'meta err';
+    return;
+  }
+  if (!Number.isFinite(breakerWindow) || breakerWindow < 1 || breakerWindow > 1440
+      || !Number.isFinite(breakerPause) || breakerPause < 1 || breakerPause > 1440) {
+    msg.textContent = '❌ 熔断的窗口/暂停时长需在 1~1440 分钟之间';
+    msg.className = 'meta err';
+    return;
+  }
+  msg.textContent = '保存中…';
+  msg.className = 'meta';
+  const checked = (id) => document.getElementById(id).checked;
+  const r = await api('/api/security', 'POST', {
+    outputGuard: {
+      enabled: checked('ogEnabled'),
+      action: document.getElementById('ogAction').value,
+      reviewTimeoutMs: Math.round(timeoutMin) * 60000,
+      skipOwnerPrivate: checked('ogSkipOwner'),
+      hard: {
+        credentials: checked('ogHardCredentials'),
+        impersonation: checked('ogHardImpersonation'),
+        credentialRequest: checked('ogHardCredentialRequest')
+      },
+      suspect: {
+        promptLeak: checked('ogSuspectPromptLeak'),
+        fingerprint: checked('ogSuspectFingerprint'),
+        internal: checked('ogSuspectInternal'),
+        protocol: checked('ogSuspectProtocol'),
+        custom: checked('ogSuspectCustom')
+      },
+      keywords: promptGuardLines(document.getElementById('ogKeywords').value),
+      extraPatterns: promptGuardLines(document.getElementById('ogExtra').value),
+      fingerprint: {
+        minChars: Number(document.getElementById('ogFingerprintMin').value) || 14,
+        minHits: Number(document.getElementById('ogFingerprintHits').value) || 1
+      },
+      notifyGroup: {
+        enabled: checked('ogNotifyGroup'),
+        template: document.getElementById('ogGroupTemplate').value
+      },
+      notifyOwner: {
+        enabled: checked('ogNotifyOwner'),
+        template: document.getElementById('ogOwnerTemplate').value
+      },
+      blockedReply: document.getElementById('ogBlockedReply').value,
+      breaker: {
+        enabled: checked('ogBreakerEnabled'),
+        threshold: Number(document.getElementById('ogBreakerThreshold').value) || 5,
+        windowMs: Math.round(breakerWindow) * 60000,
+        pauseMs: Math.round(breakerPause) * 60000,
+        scope: document.getElementById('ogBreakerScope').value,
+        countHard: checked('ogBreakerCountHard'),
+        countSuspect: checked('ogBreakerCountSuspect')
+      }
+    }
+  });
+  msg.textContent = r.ok ? '✅ 已保存（立即生效）' : ('❌ ' + (r.error || '保存失败'));
+  msg.className = r.ok ? 'meta ok' : 'meta err';
+  if (r.ok) {
+    outputGuardCache = r.outputGuard || r.security?.outputGuard || null;
+    renderOutputGuard(outputGuardCache);
+    refreshOutputGuardStatus();
+  }
+});
+
+document.getElementById('ogBreakerReset').addEventListener('click', async () => {
+  const msg = document.getElementById('ogBreakerMsg');
+  const r = await api('/api/output-guard/reset', 'POST', {});
+  msg.textContent = r.ok ? '✅ 已解除熔断' : ('❌ ' + (r.error || '解除失败'));
+  msg.className = r.ok ? 'meta ok' : 'meta err';
+  refreshOutputGuardStatus();
 });
 
 async function changeConsoleToken(generate) {
@@ -5162,8 +5637,8 @@ document.getElementById('usageClear').addEventListener('click', async () => {
 
 setConsolePage(location.hash.slice(1), { updateHash:false });
 
-refresh(); refreshRoles(); refreshWhitelist(); refreshSessions(); refreshPending(); refreshPresets(); loadSocialForm(); loadV2Config(); refreshV2Activity(); loadV2ToolLog(); loadV2SessionOptions(); refreshSocialStatus(); refreshSlang(); loadSlangConfig(); loadSecurity(); refreshSimPrompt(); refreshDshModel(); refreshUsage(); refreshUsageChart(); refreshUsageRecent();
-setInterval(() => { refresh(); refreshSessions(); refreshPending(); refreshSocialStatus(); refreshSlang(); }, 3000);
+refresh(); refreshRoles(); refreshWhitelist(); refreshSessions(); refreshPending(); refreshPresets(); loadSocialForm(); loadV2Config(); refreshV2Activity(); loadV2ToolLog(); loadV2SessionOptions(); refreshSocialStatus(); refreshSlang(); loadSlangConfig(); loadSecurity(); refreshPromptGuardReviews(); refreshOutputGuardStatus(); refreshSimPrompt(); refreshDshModel(); refreshUsage(); refreshUsageChart(); refreshUsageRecent();
+setInterval(() => { refresh(); refreshSessions(); refreshPending(); refreshPromptGuardReviews(); refreshOutputGuardStatus(); refreshSocialStatus(); refreshSlang(); }, 3000);
 // 用量看板只在本页可见时轮询：既保证「实时」，又不让其它页白白多打两份接口。
 setInterval(() => { if (currentConsolePage !== 'usage') return; refreshUsage(); refreshUsageChart(); refreshUsageRecent(); }, 3000);
 // 主题切换（纯前端，不发任何请求；选择写入 localStorage，未选择时跟随系统）
